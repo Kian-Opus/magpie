@@ -1279,10 +1279,7 @@ func providersState() providersJSON {
 		s.Gateway.Running, s.Gateway.Mine, s.Gateway.Window = true, true, true
 		// the calls without their bodies, which only an opened row reads
 		// (GET /api/gateway/call)
-		s.Gateway.Calls = gw.Recent()
-		for i := range s.Gateway.Calls {
-			s.Gateway.Calls[i].RequestBody, s.Gateway.Calls[i].ResponseBody = "", ""
-		}
+		s.Gateway.Calls = gw.RecentSummaries()
 		s.Gateway.Lanes = gw.Lanes()
 	} else {
 		o := gateway.ServedBy()

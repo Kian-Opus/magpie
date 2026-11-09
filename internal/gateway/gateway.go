@@ -452,8 +452,10 @@ type Call struct {
 	Usage             Usage  `json:"usage"`
 	RequestBody       string `json:"requestBody,omitempty"`
 	ResponseBody      string `json:"responseBody,omitempty"`
-	RequestTruncated  bool   `json:"requestTruncated,omitempty"`
-	ResponseTruncated bool   `json:"responseTruncated,omitempty"`
+	packedRequest     string // only in the Recent-calls ring, read on demand
+	packedResponse    string
+	RequestTruncated  bool `json:"requestTruncated,omitempty"`
+	ResponseTruncated bool `json:"responseTruncated,omitempty"`
 	// Archive: "<date>/<id>", where the request archive keeps the call,
 	// when it was on (archive.go); wire what it keeps besides
 	Archive string `json:"archive,omitempty"`
@@ -601,12 +603,14 @@ func New() *Server {
 
 // Recent lists the last calls, newest first.
 func (s *Server) Recent() []Call {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	out := make([]Call, len(s.recent))
-	for i, c := range s.recent {
-		out[len(s.recent)-1-i] = c
+	calls := s.recentSnapshot()
+	out := calls[:0]
+	for _, c := range calls {
+		if c, ok := c.unpackBodies(); ok {
+			out = append(out, c)
+		}
 	}
+	clear(calls[len(out):])
 	return out
 }
 
@@ -614,37 +618,41 @@ func (s *Server) Recent() []Call {
 // still in the ring.
 func (s *Server) RouteCall(route int64) (Call, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for i := len(s.recent) - 1; i >= 0; i-- {
 		if route != 0 && s.recent[i].Route == route {
-			return s.recent[i], true
+			c := s.recent[i]
+			s.mu.Unlock()
+			return c.unpackBodies()
 		}
 	}
+	s.mu.Unlock()
 	return Call{}, false
 }
 
 // RecentCall is the call numbered id while it is still in the ring.
 func (s *Server) RecentCall(id uint64) (Call, bool) {
 	s.mu.Lock()
-	defer s.mu.Unlock()
 	for _, c := range s.recent {
 		if c.ID == id {
-			return c, true
+			s.mu.Unlock()
+			return c.unpackBodies()
 		}
 	}
+	s.mu.Unlock()
 	return Call{}, false
 }
 
 func (s *Server) record(c Call) {
-	// Whole bodies belong only to the export, never to the Recent-calls ring.
-	// This is a copy: the serving call still needs them for withBodies.
-	c.wholeIn, c.wholeOut = nil, nil
+	// Whole bodies and deferred masking belong only to the export, never to
+	// the ring. This is a copy: the serving call still needs them for withBodies.
+	c.wholeIn, c.wholeOut, c.maskIn = nil, nil, nil
 	c.Canceled = usage.CanceledBy(c.Status, c.Error)
 	if c.wire != nil {
 		c.Archive = c.wire.name
 		archive(c)
 		c.wire = nil
 	}
+	c = c.packBodies()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.calls++
