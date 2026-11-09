@@ -382,6 +382,24 @@ recorded as a prediction failure (`noPrediction`).
   `TestHandedOffGatewayAnswersAConnectionNotedLate`,
   `TestInheritedForAnotherAddressIsLetGo`, `TestToolCallOfTheMagpieBeforeGoesToIt` in
   [`handover_test.go`](../../internal/gateway/handover_test.go).
+- Concurrent request bodies take room at their decoded size
+  ([`body_room.go`](../../internal/gateway/body_room.go),
+  [`body_room_read.go`](../../internal/gateway/body_room_read.go)). An identity
+  body reserves its declared size before reading. Compressed and chunked bodies
+  reserve incrementally; if growth cannot fit, the decoded prefix and remaining
+  input go to a private temporary file. The prefix's reservation is released
+  before the complete body waits in FIFO order, at most 100s, for its full size.
+  Once upload ends, the decoder is returned and the wire-idle deadline cleared
+  before this internal wait. Only after admission is the file loaded into memory;
+  success, cancellation
+  and errors remove it. Bodies that fit stay in memory. The single-body decoded
+  limit still returns 413, admission timeout returns 503, and one body larger
+  than the entire room may still run alone. Contexts sharing a Done channel
+  share a reservation, so a key guard adding caller values does not charge the
+  body again. The room counts body bytes, excluding decoder windows, slice
+  capacity and garbage awaiting collection. `TestDecodedBodyWaitsWithoutRetainingItsBody`,
+  `TestDecodedBodyWaitingReleasesMemory`, `TestDecodedBodiesGrowWithoutDeadlock`
+  and `TestDecodedBodySpoolFailures` cover admission, reclamation and cleanup.
 - An agent's turn (Chat, Responses, Messages, Gemini's generateContent and
   Codex's backend `/responses`) that magpie holds before any route is begun
   for it is watched in `counted` ([`unrouted.go`](../../internal/gateway/unrouted.go);

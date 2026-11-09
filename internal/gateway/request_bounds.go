@@ -100,25 +100,9 @@ func (s *Server) readRequestBody(w http.ResponseWriter, r *http.Request, from pr
 	if limit > 0 {
 		limits.body = limit
 	}
-	// wait for room before reading: a body waiting is not held (bodyRoom)
-	most := limits.body
-	if most <= 0 {
-		most = defaultBodyLimit
-	}
-	if n := r.ContentLength; n > 0 && n <= most {
-		if err := bodyRoom.take(r.Context(), n); err != nil {
-			w.Header().Set("Connection", "close") // its body is left unread
-			writeError(w, from, http.StatusServiceUnavailable, err.Error())
-			return nil, false
-		}
-	}
 	body, status, err := readBoundedRequestBody(w, r, limits)
 	if err != nil {
 		writeError(w, from, status, err.Error())
-		return nil, false
-	}
-	if err := bodyRoom.take(r.Context(), int64(len(body))); err != nil {
-		writeError(w, from, http.StatusServiceUnavailable, err.Error())
 		return nil, false
 	}
 	holdBody(r.Context(), body)
@@ -232,6 +216,17 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limits reque
 	if r.ContentLength > limits.body {
 		return reject(http.StatusRequestEntityTooLarge, overLimit(limits.body))
 	}
+	// Only an identity body's wire length can reserve its decoded size.
+	// Keep this in the shared reader: key guards and relays read bodies too.
+	declared := r.ContentLength
+	if enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc != "" && enc != "identity" {
+		declared = -1
+	}
+	if declared > 0 {
+		if err := bodyRoom.take(r.Context(), declared); err != nil {
+			return reject(http.StatusServiceUnavailable, err)
+		}
+	}
 	if err := controller.SetReadDeadline(time.Now().Add(limits.readTimeout)); err != nil && !errors.Is(err, http.ErrNotSupported) {
 		return reject(http.StatusInternalServerError, errors.New("could not set request body deadline"))
 	}
@@ -242,11 +237,6 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limits reque
 			return reject(http.StatusRequestTimeout, errors.New("request body read timed out"))
 		}
 		return reject(http.StatusBadRequest, err)
-	}
-	// the wire length is the body's length only when it is sent as it is
-	declared := r.ContentLength
-	if enc := strings.ToLower(strings.TrimSpace(r.Header.Get("Content-Encoding"))); enc != "" && enc != "identity" {
-		declared = -1
 	}
 	original := r.Body
 	r.Body = &idleBody{original, controller, limits.readTimeout}
@@ -259,13 +249,33 @@ func readBoundedRequestBody(w http.ResponseWriter, r *http.Request, limits reque
 		return readFailure(err)
 	}
 	defer rd.Close()
-	// Limit decoded bytes as well.
-	body, err := readSized(io.LimitReader(rd, limits.body+1), declared)
+	// Limit decoded bytes as well. Unknown decoded lengths acquire room as
+	// they grow, spooling before they wait if there is not enough left.
+	bounded := io.LimitReader(rd, limits.body+1)
+	var body []byte
+	if declared > 0 {
+		body, err = readSized(bounded, declared)
+	} else {
+		var status int
+		body, status, err = readRoomBody(r.Context(), bounded, limits.body, func() {
+			// Upload is complete. Return the decoder and clear the wire-idle
+			// deadline before waiting: net/http may already be reading the
+			// keepalive connection in the background to detect disconnects.
+			rd.Close()
+			controller.SetReadDeadline(time.Time{})
+		})
+		if err != nil && status != 0 {
+			return reject(status, err)
+		}
+	}
 	if int64(len(body)) > limits.body {
 		return reject(http.StatusRequestEntityTooLarge, overLimit(limits.body))
 	}
 	if err != nil {
 		return readFailure(err)
+	}
+	if err := bodyRoom.take(r.Context(), int64(len(body))); err != nil {
+		return reject(http.StatusServiceUnavailable, err)
 	}
 	return body, 0, nil
 }

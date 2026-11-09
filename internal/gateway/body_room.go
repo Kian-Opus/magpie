@@ -31,9 +31,9 @@ type bodyRoomT struct {
 	why   string
 	sized bool
 	held  int64
-	// by is what each request being served holds, by its context, so a
-	// body read twice in one request takes its room once
-	by    map[context.Context]int64
+	// Context values may change in guards; Done identifies the request's
+	// lifetime so reading its body again does not take room twice.
+	by    map[<-chan struct{}]int64
 	queue []*bodyWaiter
 }
 
@@ -86,13 +86,14 @@ func (e *bodyFull) Error() string {
 		e.held>>20, e.room>>20, e.why, e.waited, e.n>>20)
 }
 
-// take holds n bytes of room for the request ctx belongs to until ctx is
-// done, waiting its turn for it. A request takes it on its Content-Length
-// before its body is read, so the ones waiting don't hold theirs, and
-// again on the body read, which only adds what that is over the first. A
-// ctx that is never done (a caller's own) takes nothing, since nothing
-// would give it back.
+// take holds n bytes until ctx is done, waiting in FIFO order. Growing an
+// existing reservation never waits while holding part of the room: callers
+// must spool and release their partial body before waiting for its full size.
+// A context that is never done takes nothing, since nothing gives it back.
 func (b *bodyRoomT) take(ctx context.Context, n int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if n < bodyRoomFree || ctx.Done() == nil {
 		return nil
 	}
@@ -101,15 +102,13 @@ func (b *bodyRoomT) take(ctx context.Context, n int64) error {
 		b.sized = true
 		b.room, b.why = bodyRoomSize()
 	}
-	if h, ok := b.by[ctx]; ok || b.room <= 0 {
-		if ok && n > h {
-			// the body read is bigger than its request said, a compressed
-			// one: it holds what it is, let in already
-			b.held += n - h
-			b.by[ctx] = n
-		}
+	if _, ok := b.by[ctx.Done()]; ok || b.room <= 0 {
+		fits := b.tryTakeLocked(ctx, n)
 		b.mu.Unlock()
-		return nil
+		if !fits {
+			return fmt.Errorf("not enough room to grow this request body to %d MiB; its partial reservation must be released before waiting", n>>20)
+		}
+		return ctx.Err()
 	}
 	w := &bodyWaiter{ctx: ctx, n: n, in: make(chan struct{})}
 	b.queue = append(b.queue, w)
@@ -154,18 +153,16 @@ func (b *bodyRoomT) take(ctx context.Context, n int64) error {
 func (b *bodyRoomT) letIn() {
 	for len(b.queue) > 0 {
 		w := b.queue[0]
+		if w.ctx.Err() != nil {
+			b.queue = b.queue[1:]
+			continue
+		}
 		if b.held > 0 && b.held+w.n > b.room {
 			return
 		}
 		b.queue = b.queue[1:]
-		if b.by == nil {
-			b.by = map[context.Context]int64{}
-		}
-		b.held += w.n
-		b.by[w.ctx] = w.n
+		b.hold(w.ctx, w.n)
 		close(w.in)
-		ctx := w.ctx
-		context.AfterFunc(ctx, func() { b.give(ctx) })
 	}
 }
 
@@ -173,7 +170,71 @@ func (b *bodyRoomT) letIn() {
 func (b *bodyRoomT) give(ctx context.Context) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	b.held -= b.by[ctx]
-	delete(b.by, ctx)
+	b.held -= b.by[ctx.Done()]
+	delete(b.by, ctx.Done())
 	b.letIn()
+}
+
+// tryTake grows a body while decoding, without waiting with a partial body.
+func (b *bodyRoomT) tryTake(ctx context.Context, n int64) bool {
+	if n < bodyRoomFree || ctx.Done() == nil {
+		return true
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if !b.sized {
+		b.sized = true
+		b.room, b.why = bodyRoomSize()
+	}
+	return b.tryTakeLocked(ctx, n)
+}
+
+// tryTakeLocked and hold run under b.mu. Only an already admitted body may
+// grow ahead of the queue, so it can finish and release its room.
+func (b *bodyRoomT) tryTakeLocked(ctx context.Context, n int64) bool {
+	if ctx.Err() != nil {
+		return false
+	}
+	if b.room <= 0 {
+		return true
+	}
+	h, exists := b.by[ctx.Done()]
+	if n <= h {
+		return true
+	}
+	if (!exists && len(b.queue) > 0) || (b.held != h && b.held+n-h > b.room) {
+		return false
+	}
+	b.hold(ctx, n)
+	return true
+}
+
+func (b *bodyRoomT) hold(ctx context.Context, n int64) {
+	if b.by == nil {
+		b.by = make(map[<-chan struct{}]int64)
+	}
+	h, exists := b.by[ctx.Done()]
+	b.held += n - h
+	b.by[ctx.Done()] = n
+	if !exists {
+		context.AfterFunc(ctx, func() { b.give(ctx) })
+	}
+}
+
+// trim returns the read allowance beyond the body's actual size.
+func (b *bodyRoomT) trim(ctx context.Context, n int64) {
+	if n < bodyRoomFree {
+		n = 0
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if h := b.by[ctx.Done()]; h > n {
+		b.held -= h - n
+		if n == 0 {
+			delete(b.by, ctx.Done())
+		} else {
+			b.by[ctx.Done()] = n
+		}
+		b.letIn()
+	}
 }
