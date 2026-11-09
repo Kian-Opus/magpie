@@ -175,6 +175,7 @@ type imageMCPStore struct {
 	files   map[string]*imageFile
 	order   []string // files, oldest first
 	bytes   int
+	cleanup *time.Timer // expires cached files and completed jobs even while idle
 	running sync.WaitGroup
 	// secret signs each file's URL (imageFileToken): made at the first
 	// file, never written anywhere, so a restart, which loses the files,
@@ -198,6 +199,7 @@ type imageFile struct {
 	data      []byte
 	mime, key string
 	made      time.Time
+	job       string // evict its cached result when this file goes
 }
 
 func (s *Server) imageMCP(w http.ResponseWriter, r *http.Request) {
@@ -398,7 +400,9 @@ func (s *Server) imageMCPDrawn(rec *replyRecorder, key, base string) map[string]
 		urls = append(urls, base+ImageMCPFiles+s.imageMCPKeepFile(img, mt, key))
 		inline := len(img) <= imageMCPInline
 		if inline {
-			content = append(content, map[string]any{"type": "image", "data": base64.StdEncoding.EncodeToString(img), "mimeType": mt})
+			// JSON encodes []byte as base64 on delivery. The completed job
+			// shares the file's bytes instead of keeping a second, larger copy.
+			content = append(content, map[string]any{"type": "image", "data": img, "mimeType": mt})
 		}
 		files = append(files, MadeFile{URL: urls[len(urls)-1], Inline: inline})
 		if d.Revised != "" {
@@ -584,6 +588,8 @@ func (s *Server) imageMCPResult(r *http.Request, id string) map[string]any {
 	}
 	st := &s.imageStore
 	st.mu.Lock()
+	st.prune(time.Now(), imageMCPFilesMost)
+	st.armCleanup()
 	j := st.jobs[id]
 	st.mu.Unlock()
 	if j == nil || j.key != access.Caller(r.Context()).KeyID {
@@ -597,25 +603,24 @@ func (s *Server) imageMCPStart(key string, use *mcpUse, draw func() map[string]a
 	st := &s.imageStore
 	j := &imageJob{id: "img_" + randomHex(12), key: key, started: time.Now(), done: make(chan struct{}), use: use}
 	st.mu.Lock()
+	st.prune(time.Now(), imageMCPFilesMost)
 	if st.jobs == nil {
 		st.jobs = map[string]*imageJob{}
 	}
-	for id, old := range st.jobs {
-		select {
-		case <-old.done:
-			if time.Since(old.started) > imageMCPKeep {
-				delete(st.jobs, id)
-			}
-		default:
-		}
-	}
 	st.jobs[j.id] = j
+	st.armCleanup()
 	st.running.Add(1)
 	st.mu.Unlock()
 	go func() {
 		defer st.running.Done()
-		defer close(j.done)
-		j.result = draw()
+		result := draw()
+		st.mu.Lock()
+		defer st.mu.Unlock()
+		j.result = result
+		st.linkJob(j)
+		close(j.done)
+		st.prune(time.Now(), imageMCPFilesMost)
+		st.armCleanup()
 	}()
 	return j
 }
@@ -654,12 +659,8 @@ func (s *Server) imageMCPKeepFile(img []byte, mt, key string) string {
 	at := name + "?" + imageTokenParam + "=" + imageFileToken(st.secret, name, key, made.Add(imageMCPKeep).Unix())
 	st.order = append(st.order, name)
 	st.bytes += len(img)
-	for len(st.order) > 1 && (st.bytes > imageMCPFilesMost || time.Since(st.files[st.order[0]].made) > imageMCPKeep) {
-		old := st.order[0]
-		st.order = st.order[1:]
-		st.bytes -= len(st.files[old].data)
-		delete(st.files, old)
-	}
+	st.prune(made, imageMCPFilesMost)
+	st.armCleanup()
 	return at
 }
 

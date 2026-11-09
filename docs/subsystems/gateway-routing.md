@@ -2255,6 +2255,14 @@ answers within 20 seconds, else with an id that `generation_result` waits on.
 Each image comes back as MCP image content (up to 5 MB each) and at a URL
 under `/mcp/magpie/image/files/` (a vendor's URL is fetched first). The
 file store is in memory, kept an hour and 256 MB at most, oldest first out.
+Completed jobs share the files' binary image data; JSON encodes it as base64
+only when delivering a tool answer, rather than keeping a base64 copy beside
+each file. Evicting a file also removes its completed job from the result cache.
+An answer already being delivered keeps its bytes until delivery ends. An
+expiry timer clears files and completed jobs even when no new request arrives;
+it holds the store weakly so an unused server can be collected. A running job
+is kept until it finishes, and a result whose files were evicted while it ran
+is delivered to its waiting caller without being cached again.
 A file and a job belong to the gateway key that made them: another key gets
 404 (`KeyID`). The URL handed out carries `?t=<exp>.<sig>`
 (`imageFileToken`: HMAC-SHA256 of the file's name, its expiry and the
